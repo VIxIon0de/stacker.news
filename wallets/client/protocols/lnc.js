@@ -1,4 +1,6 @@
 import { Mutex } from 'async-mutex'
+import { LND_PATHFINDING_TIMEOUT_MS } from '@/lib/constants'
+import { bolt11Msats } from '@/lib/bolt11'
 import { walletAmountToMsatsOrUndefined, walletAmountToSats } from '@/wallets/lib/amount'
 import { isAbortLike, raceAbort, throwIfAborted } from '@/lib/time'
 import { WalletPaymentRejectedError, WalletPermissionsError, WalletBalanceProbeSkipped } from '@/wallets/client/errors'
@@ -6,14 +8,30 @@ import { verificationUnsupportedResult } from '@/wallets/lib/external-transactio
 import { walletBalance } from './util'
 
 export const name = 'LNC'
-// LND enforces routing fee caps via the feeLimit oneof on SendPaymentSync.
+// LND enforces routing fee caps via feeLimitSat on SendPaymentV2 and the
+// feeLimit oneof on SendPaymentSync.
 export const enforcesMaxFee = true
 
 const serverHost = 'mailbox.terminal.lightning.today:443'
-const LNC_SEND_PAYMENT_PERMISSION = 'lnrpc.Lightning.SendPaymentSync'
+const LNC_SEND_PAYMENT_PERMISSION = 'routerrpc.Router.SendPaymentV2'
+// LND 0.21 removed SendPaymentSync. Sessions minted before that still carry only
+// this permission, and they keep working against a node that still serves it.
+const LNC_LEGACY_SEND_PAYMENT_PERMISSION = 'lnrpc.Lightning.SendPaymentSync'
 const LNC_CHANNEL_BALANCE_PERMISSION = 'lnrpc.Lightning.ChannelBalance'
 const LNC_TRACK_PAYMENT_PERMISSION = 'routerrpc.Router.TrackPaymentV2'
 const LNC_SEND_COINS_PERMISSION = 'lnrpc.Lightning.SendCoins'
+// SendPaymentV2 requires a pathfinding deadline. Use the same one SN gives its
+// own node so a user's wallet gives up at a familiar point, well inside the
+// caller's WALLET_SEND_PAYMENT_TIMEOUT_MS.
+const LNC_PAYMENT_TIMEOUT_SECONDS = Math.floor(LND_PATHFINDING_TIMEOUT_MS / 1000)
+// SendPaymentV2 leaves its routing fee limit at 0 msat unless you set one, and
+// "only zero-fee routes will be considered" — effectively nothing routes.
+// SendPaymentSync had no such trap: lnrpc documents that an unset feeLimit means
+// "100% fees for small amounts (<=1k sat) or 5% fees for larger amounts". A send
+// with no caller maxFee reproduces that budget explicitly so the wallet keeps
+// paying what it pays today.
+const LND_SMALL_PAYMENT_MSATS = 1_000_000n
+const LND_LARGE_PAYMENT_FEE_PERCENT = 5n
 // Disconnect an idle instance this long after the last call.
 const IDLE_DISCONNECT_MS = 4000
 // These SendPaymentSync payment_error values do not prove failure ("invoice is already
@@ -22,42 +40,92 @@ const LNC_NON_TERMINAL_PAYMENT_ERRORS = /payment is in transition|payment alread
 
 export async function sendPayment (bolt11, credentials, { logger, maxFee, signal }) {
   return await connection.use(credentials, { logger, signal }, async lnc => {
-    const request = { paymentRequest: bolt11 }
-    if (maxFee != null) {
-      if (!Number.isSafeInteger(maxFee) || maxFee < 0) {
-        throw new Error(`invalid maxFee: ${maxFee}`)
-      }
-      // LND FeeLimit accepts fixed sats via the `fixed` oneof field; serialize
-      // as a string to avoid the 53-bit int safety ceiling.
-      request.feeLimit = { fixed: String(maxFee) }
+    if (lnc.hasPerms(LNC_SEND_PAYMENT_PERMISSION)) {
+      return await sendPaymentV2(lnc, bolt11, { maxFee, signal })
     }
-    // a transport drop after the RPC was transmitted may leave the payment in
-    // flight; classifyWalletPaymentError treats such errors as UNKNOWN by default
-    const result = await connection.call(lnc.lnd.lightning.sendPaymentSync(request), { logger, signal })
-    const { paymentError, paymentPreimage: preimage } = result
-    if (paymentError) {
-      // recorded as UNKNOWN; checkPayment/TrackPaymentV2 resolves the true outcome
-      if (LNC_NON_TERMINAL_PAYMENT_ERRORS.test(paymentError)) {
-        return { status: 'UNKNOWN', detail: paymentError }
-      }
-      throw new WalletPaymentRejectedError(paymentError) // all HTLC attempts resolved -> definitive
+    return await sendPaymentSync(lnc, bolt11, { logger, maxFee, signal })
+  })
+}
+
+function validateMaxFee (maxFee) {
+  if (!Number.isSafeInteger(maxFee) || maxFee < 0) {
+    throw new Error(`invalid maxFee: ${maxFee}`)
+  }
+}
+
+// routerrpc.Router.SendPaymentV2 streams lnrpc.Payment updates — the same message
+// TrackPaymentV2 returns — so the outcome is read exactly the way checkPayment
+// reads it, proof included.
+async function sendPaymentV2 (lnc, bolt11, { maxFee, signal }) {
+  const request = {
+    paymentRequest: bolt11,
+    timeoutSeconds: LNC_PAYMENT_TIMEOUT_SECONDS,
+    // only the terminal update matters here; in-flight updates would resolve the
+    // call on the first HTLC attempt, before the payment has an outcome
+    noInflightUpdates: true
+  }
+  if (maxFee != null) {
+    validateMaxFee(maxFee)
+    // int64 field: serialize as a string to avoid the 53-bit int safety ceiling
+    request.feeLimitSat = String(maxFee)
+  } else {
+    const feeLimitMsats = lndDefaultFeeLimitMsats(bolt11)
+    // an amountless invoice gives nothing to derive a budget from, and this path
+    // never sets `amt` either, so leave it to lnd rather than guess
+    if (feeLimitMsats != null) request.feeLimitMsat = String(feeLimitMsats)
+  }
+
+  // a transport drop after the RPC was transmitted may leave the payment in
+  // flight; classifyWalletPaymentError treats such errors as UNKNOWN by default
+  const payment = await lncStream(
+    (onData, onError) => lnc.lnd.router.sendPaymentV2(request, onData, onError), { signal })
+
+  if (lndPaymentSucceeded(payment)) return lndSettledResult(payment)
+  if (lndPaymentFailed(payment)) {
+    // every HTLC attempt resolved -> definitive
+    throw new WalletPaymentRejectedError(lndFailureDetail(payment))
+  }
+  // no terminal update despite noInflightUpdates: the payment may still be in
+  // flight, so checkPayment/TrackPaymentV2 resolves the true outcome
+  return { status: 'UNKNOWN', detail: lndFailureDetail(payment) }
+}
+
+// LND 0.21 removed SendPaymentSync; this path exists for sessions that were
+// minted with only that permission and talk to a node that still serves it.
+async function sendPaymentSync (lnc, bolt11, { logger, maxFee, signal }) {
+  const request = { paymentRequest: bolt11 }
+  if (maxFee != null) {
+    validateMaxFee(maxFee)
+    // LND FeeLimit accepts fixed sats via the `fixed` oneof field; serialize
+    // as a string to avoid the 53-bit int safety ceiling.
+    request.feeLimit = { fixed: String(maxFee) }
+  }
+  // a transport drop after the RPC was transmitted may leave the payment in
+  // flight; classifyWalletPaymentError treats such errors as UNKNOWN by default
+  const result = await connection.call(lnc.lnd.lightning.sendPaymentSync(request), { logger, signal })
+  const { paymentError, paymentPreimage: preimage } = result
+  if (paymentError) {
+    // recorded as UNKNOWN; checkPayment/TrackPaymentV2 resolves the true outcome
+    if (LNC_NON_TERMINAL_PAYMENT_ERRORS.test(paymentError)) {
+      return { status: 'UNKNOWN', detail: paymentError }
     }
-    // A successful provider response is authoritative even without proof.
-    if (!preimage) {
-      return {
-        status: 'SETTLED',
-        actualFeeMsats: lndPaymentFeeMsats(result)
-      }
-    }
-    // downstream verifyPreimage does the shape check plus sha256 verification;
-    // a malformed value should surface as "invalid proof of payment", not be dropped here
-    const preimageHex = Buffer.from(preimage, 'base64').toString('hex')
+    throw new WalletPaymentRejectedError(paymentError) // all HTLC attempts resolved -> definitive
+  }
+  // A successful provider response is authoritative even without proof.
+  if (!preimage) {
     return {
       status: 'SETTLED',
-      preimage: preimageHex,
       actualFeeMsats: lndPaymentFeeMsats(result)
     }
-  })
+  }
+  // downstream verifyPreimage does the shape check plus sha256 verification;
+  // a malformed value should surface as "invalid proof of payment", not be dropped here
+  const preimageHex = Buffer.from(preimage, 'base64').toString('hex')
+  return {
+    status: 'SETTLED',
+    preimage: preimageHex,
+    actualFeeMsats: lndPaymentFeeMsats(result)
+  }
 }
 
 export async function testSendPayment (credentials, { logger, signal }) {
@@ -81,20 +149,9 @@ export async function checkPayment ({ hash }, credentials, { logger, signal }) {
     const payment = await trackPayment(lnc, hash, { signal })
     if (!payment) return { status: 'PENDING' }
 
-    if (lndPaymentSucceeded(payment)) {
-      const { paymentPreimage: preimage } = payment
-      return {
-        status: 'SETTLED',
-        preimage,
-        actualFeeMsats: lndPaymentFeeMsats(payment)
-      }
-    }
+    if (lndPaymentSucceeded(payment)) return lndSettledResult(payment)
     if (lndPaymentFailed(payment)) {
-      const reason = payment.failureReason && String(payment.failureReason)
-      return {
-        status: 'FAILED',
-        detail: reason && reason !== 'FAILURE_REASON_NONE' ? reason : 'lnd reports payment failed'
-      }
+      return { status: 'FAILED', detail: lndFailureDetail(payment) }
     }
 
     return { status: 'PENDING' }
@@ -114,38 +171,47 @@ export async function getBalance (credentials, { signal, logger } = {}) {
   })
 }
 
-async function trackPayment (lnc, hash, { signal }) {
+// lnc-web exposes a streaming RPC as (request, onData, onError) and keeps
+// streaming; we only ever want the first message. raceAbort owns cancellation so
+// the caller's timeout diagnosis propagates instead of a fabricated bare
+// 'aborted' error.
+async function lncStream (invoke, { signal }) {
   throwIfAborted(signal)
 
-  // raceAbort owns cancellation, so the caller's timeout diagnosis propagates
-  // instead of a fabricated bare 'aborted' error
   return await raceAbort(new Promise((resolve, reject) => {
     let done = false
-    const paymentHash = Buffer.from(hash, 'hex').toString('base64')
-    const request = {
-      paymentHash,
-      // in-flight updates make an existing payment answer immediately: the first
-      // event resolves, and checkPayment maps non-terminal statuses to PENDING
-      // instead of hanging until the caller's timeout aborts
-      noInflightUpdates: false
-    }
-
-    const finish = (err, payment) => {
+    const finish = (err, data) => {
       if (done) return
       done = true
-      if (err) {
-        const message = err?.message ?? err?.details ?? String(err)
-        if (message.includes("payment isn't initiated") || message.includes('SentPaymentNotFound')) return resolve(null)
-        return reject(err)
-      }
-      resolve(payment)
+      if (err) return reject(err)
+      resolve(data)
     }
     try {
-      lnc.lnd.router.trackPaymentV2(request, payment => finish(null, payment), err => finish(err))
+      invoke(data => finish(null, data), err => finish(err))
     } catch (err) {
       finish(err)
     }
   }), signal)
+}
+
+async function trackPayment (lnc, hash, { signal }) {
+  const request = {
+    paymentHash: Buffer.from(hash, 'hex').toString('base64'),
+    // in-flight updates make an existing payment answer immediately: the first
+    // event resolves, and checkPayment maps non-terminal statuses to PENDING
+    // instead of hanging until the caller's timeout aborts
+    noInflightUpdates: false
+  }
+
+  try {
+    return await lncStream(
+      (onData, onError) => lnc.lnd.router.trackPaymentV2(request, onData, onError), { signal })
+  } catch (err) {
+    // lnd has never heard of this hash, so there is nothing to report yet
+    const message = err?.message ?? err?.details ?? String(err)
+    if (message.includes("payment isn't initiated") || message.includes('SentPaymentNotFound')) return null
+    throw err
+  }
 }
 
 // Sole owner of the LNC connection lifecycle. lnc-web wraps a single global
@@ -297,7 +363,7 @@ class LncConnection {
 const connection = new LncConnection()
 
 function validateNarrowPerms (lnc) {
-  if (!lnc.hasPerms(LNC_SEND_PAYMENT_PERMISSION)) {
+  if (!lnc.hasPerms(LNC_SEND_PAYMENT_PERMISSION) && !lnc.hasPerms(LNC_LEGACY_SEND_PAYMENT_PERMISSION)) {
     throw new WalletPermissionsError(`missing permission: ${LNC_SEND_PAYMENT_PERMISSION}`)
   }
   if (lnc.hasPerms(LNC_SEND_COINS_PERMISSION)) {
@@ -372,6 +438,31 @@ const lndPaymentSucceeded = payment =>
   payment?.status === 2 || String(payment?.status).toUpperCase() === 'SUCCEEDED'
 const lndPaymentFailed = payment =>
   payment?.status === 3 || String(payment?.status).toUpperCase() === 'FAILED'
+
+function lndSettledResult (payment) {
+  const result = {
+    status: 'SETTLED',
+    actualFeeMsats: lndPaymentFeeMsats(payment)
+  }
+  // a settled payment is authoritative even without proof; downstream
+  // verifyPreimage does the shape check plus sha256 verification, so a malformed
+  // value should surface as "invalid proof of payment" rather than be dropped here
+  if (payment.paymentPreimage) result.preimage = payment.paymentPreimage
+  return result
+}
+
+// The budget lnrpc applies to SendPaymentSync when the caller sets no feeLimit.
+function lndDefaultFeeLimitMsats (bolt11) {
+  const msats = bolt11Msats(bolt11)
+  if (msats == null) return null
+  return msats <= LND_SMALL_PAYMENT_MSATS ? msats : msats * LND_LARGE_PAYMENT_FEE_PERCENT / 100n
+}
+
+// FAILURE_REASON_NONE means lnd stopped without recording a reason
+function lndFailureDetail (payment) {
+  const reason = payment?.failureReason && String(payment.failureReason)
+  return reason && reason !== 'FAILURE_REASON_NONE' ? reason : 'lnd reports payment failed'
+}
 
 function lndAmountToSats (amount) {
   try {
