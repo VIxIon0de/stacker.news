@@ -2,34 +2,56 @@ import { useCallback } from 'react'
 import { useToast } from './toast'
 import { Button } from 'react-bootstrap'
 import Nostr, { DEFAULT_CROSSPOSTING_RELAYS } from '@/lib/nostr'
+import { markdownToNostrText, imetaTags } from '@/lib/nostr-content'
 import { gql } from '@apollo/client'
 import { useApolloClient, useMutation, useQuery } from '@apollo/client/react'
 import { SETTINGS } from '@/fragments/users'
 import { ITEM_FULL_FIELDS, POLL_FIELDS } from '@/fragments/items'
 
-function itemToContent (item, { includeTitle = true } = {}) {
+// `plainText` is for kind 1 events only: NIP-10 says they are plain text, so the
+// markdown body is converted and its images are re-emitted as bare URLs, which
+// is the only form a note client will embed. NIP-23 articles and NIP-99
+// listings keep the markdown they are defined to carry.
+export function itemToContent (item, { includeTitle = true, plainText = false } = {}) {
   let content = includeTitle ? item.title : ''
 
   if (item.url) {
     content += `\n${item.url}`
   }
 
+  let media = []
+
   if (item.text) {
-    content += `\n\n${item.text}`
+    if (plainText) {
+      const converted = markdownToNostrText(item.text)
+      media = converted.media
+      if (converted.text) {
+        content += `\n\n${converted.text}`
+      }
+    } else {
+      content += `\n\n${item.text}`
+    }
+  }
+
+  for (const { url } of media) {
+    content += `\n\n${url}`
   }
 
   content += `\n\nhttps://stacker.news/items/${item.id}`
 
-  return content.trim()
+  return { content: content.trim(), media }
 }
 
-function discussionToEvent (item) {
+export function discussionToEvent (item) {
   const createdAt = Math.floor(Date.now() / 1000)
+
+  // NIP-23 long-form content is markdown; it is left as authored.
+  const { content } = itemToContent(item, { includeTitle: false })
 
   return {
     created_at: createdAt,
     kind: 30023,
-    content: itemToContent(item, { includeTitle: false }),
+    content,
     tags: [
       ['d', item.id.toString()],
       ['title', item.title],
@@ -38,39 +60,47 @@ function discussionToEvent (item) {
   }
 }
 
-function linkToEvent (item) {
+export function linkToEvent (item) {
   const createdAt = Math.floor(Date.now() / 1000)
+
+  const { content, media } = itemToContent(item, { plainText: true })
 
   return {
     created_at: createdAt,
     kind: 1,
-    content: itemToContent(item),
-    tags: []
+    content,
+    tags: imetaTags(media)
   }
 }
 
-function pollToEvent (item) {
+export function pollToEvent (item) {
   const createdAt = Math.floor(Date.now() / 1000)
 
   const expiresAt = createdAt + 86400
 
+  const { content, media } = itemToContent(item, { plainText: true })
+
   return {
     created_at: createdAt,
     kind: 1,
-    content: itemToContent(item),
+    content,
     tags: [
-      ['poll', 'single', expiresAt.toString(), item.title, ...item.poll.options.map(op => op?.option.toString())]
+      ['poll', 'single', expiresAt.toString(), item.title, ...item.poll.options.map(op => op?.option.toString())],
+      ...imetaTags(media)
     ]
   }
 }
 
-function bountyToEvent (item) {
+export function bountyToEvent (item) {
   const createdAt = Math.floor(Date.now() / 1000)
+
+  // NIP-99 classified listings describe themselves in markdown.
+  const { content } = itemToContent(item)
 
   return {
     created_at: createdAt,
     kind: 30402,
-    content: itemToContent(item),
+    content,
     tags: [
       ['d', item.id.toString()],
       ['title', item.title],
