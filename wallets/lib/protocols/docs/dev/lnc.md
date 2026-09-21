@@ -4,9 +4,13 @@ This can be done one of two ways:
 
 # cli
 
-We need `/lnrpc.Lightning/SendPaymentSync` to send payments. To show balances
+We need `/routerrpc.Router/SendPaymentV2` to send payments. To show balances
 in the wallet list, the same session must also allow
 `/lnrpc.Lightning/ChannelBalance`.
+
+LND 0.21 removed `SendPaymentSync`. A session that only allows it still works
+against an older node — the adapter falls back when `SendPaymentV2` is not in
+the session's permissions — but new sessions should grant `SendPaymentV2`.
 
 ## account session
 
@@ -32,7 +36,7 @@ $ sndev cli litd sessions add --type account --label sndev --account_id $(sndev 
 For a custom session with balance support:
 
 ```bash
-$ sndev cli litd sessions add --type custom --label <your label> --uri /lnrpc.Lightning/SendPaymentSync --uri /lnrpc.Lightning/ChannelBalance
+$ sndev cli litd sessions add --type custom --label <your label> --uri /routerrpc.Router/SendPaymentV2 --uri /lnrpc.Lightning/ChannelBalance
 ```
 
 For a custom send-only session, omit `--uri /lnrpc.Lightning/ChannelBalance`.
